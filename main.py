@@ -675,6 +675,76 @@ async def send_to_admins(bot: Bot, text: str, kb: Optional[InlineKeyboardMarkup]
             logger.error("Failed to notify admin %s: %s", aid, e)
 
 
+async def send_payment_proof_to_admins(
+    bot: Bot,
+    source_message: Message,
+    text: str,
+    order_id: str,
+) -> None:
+    """Send payment details and the user's proof in one admin message.
+
+    Telegram photos are represented by ``Message.photo`` and files sent as
+    documents by ``Message.document``. The old flow stored their file_id but
+    only sent a text notification, so admins could not see the proof.
+    """
+    markup = approval_kb(order_id)
+    photo_id = source_message.photo[-1].file_id if source_message.photo else None
+    document_id = source_message.document.file_id if source_message.document else None
+
+    if source_message.photo:
+        proof_kind = "photo"
+    elif source_message.document:
+        proof_kind = "document"
+    else:
+        proof_kind = "text"
+
+    for aid in config.admin_ids:
+        try:
+            if photo_id:
+                await bot.send_photo(
+                    aid,
+                    photo=photo_id,
+                    caption=text,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                )
+            elif document_id:
+                await bot.send_document(
+                    aid,
+                    document=document_id,
+                    caption=text,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    aid,
+                    text,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to send %s payment proof for order %s to admin %s: %s",
+                proof_kind,
+                order_id,
+                aid,
+                e,
+            )
+            # Keep the approval workflow usable even if Telegram rejects the
+            # attachment (for example, an expired file_id).
+            if photo_id or document_id:
+                try:
+                    await bot.send_message(
+                        aid,
+                        text + "\n\n⚠️ Proof attachment could not be forwarded.",
+                        reply_markup=markup,
+                        parse_mode="HTML",
+                    )
+                except Exception as fallback_error:
+                    logger.error("Admin fallback notification failed: %s", fallback_error)
+
+
 async def notify_referral_success(bot: Bot, referrer: User, referred: User) -> None:
     tg_req = int(await get_setting("referral_tg_requirement", "15"))
     panel_req = int(await get_setting("referral_panel_requirement", "10"))
@@ -1208,7 +1278,16 @@ async def cb_tg_submit(call: CallbackQuery, state: FSMContext) -> None:
 async def msg_tg_proof(msg: Message, state: FSMContext) -> None:
     data = await state.get_data()
     order_id = data.get("order_id")
-    proof = msg.text or (msg.photo[-1].file_id if msg.photo else "")
+    proof = (
+        msg.photo[-1].file_id
+        if msg.photo
+        else msg.document.file_id
+        if msg.document
+        else (msg.text or "").strip()
+    )
+    if not proof:
+        await msg.answer("❌ Payment reference, screenshot, or image file bhejo.")
+        return
     o = await get_order(order_id)
     if not o:
         await msg.answer("Order not found.", reply_markup=main_menu_kb())
@@ -1226,7 +1305,7 @@ async def msg_tg_proof(msg: Message, state: FSMContext) -> None:
         f"Order ID: <code>{order_id}</code>\n"
         f"Status: PENDING"
     )
-    await send_to_admins(msg.bot, text, approval_kb(order_id))
+    await send_payment_proof_to_admins(msg.bot, msg, text, order_id)
     await msg.answer("✅ Payment submitted! Await admin approval.", reply_markup=main_menu_kb())
     await state.clear()
 
@@ -1368,7 +1447,16 @@ async def cb_panel_submit(call: CallbackQuery, state: FSMContext) -> None:
 async def msg_panel_proof(msg: Message, state: FSMContext) -> None:
     data = await state.get_data()
     order_id = data.get("order_id")
-    proof = msg.text or (msg.photo[-1].file_id if msg.photo else "")
+    proof = (
+        msg.photo[-1].file_id
+        if msg.photo
+        else msg.document.file_id
+        if msg.document
+        else (msg.text or "").strip()
+    )
+    if not proof:
+        await msg.answer("❌ Payment reference, screenshot, or image file bhejo.")
+        return
     o = await get_order(order_id)
     if not o:
         await msg.answer("Order not found.", reply_markup=main_menu_kb())
@@ -1386,7 +1474,7 @@ async def msg_panel_proof(msg: Message, state: FSMContext) -> None:
         f"Order ID: <code>{order_id}</code>\n"
         f"Status: PENDING"
     )
-    await send_to_admins(msg.bot, text, approval_kb(order_id))
+    await send_payment_proof_to_admins(msg.bot, msg, text, order_id)
     await msg.answer("✅ Payment submitted! Await admin approval.", reply_markup=main_menu_kb())
     await state.clear()
 
