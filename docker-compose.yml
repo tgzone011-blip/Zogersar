@@ -1,0 +1,14 @@
+services:
+  zonex-x-bot:
+    build: .
+    container_name: zonex-x-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////app/data/jonex.db
+    volumes:
+      - zonex_data:/app/data
+
+volumes:
+  zonex_data:
