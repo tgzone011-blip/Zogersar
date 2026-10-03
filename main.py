@@ -5,7 +5,7 @@ Telegram bot with channel verification, referral, TG/Panel selling,
 UPI payment requests, admin approval, and automatic delivery.
 
 Requirements:
-    pip install aiogram aiosqlite SQLAlchemy python-dotenv qrcode[pil] Pillow
+    pip install aiogram aiosqlite "SQLAlchemy[asyncio]" asyncpg python-dotenv "qrcode[pil]" Pillow
 
 Run:
     python main.py
@@ -25,13 +25,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import qrcode
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -70,10 +70,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    handlers=[
-        logging.FileHandler("jonex.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("jonex")
 
@@ -89,13 +86,46 @@ def _int_list(raw: str) -> List[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
 
 
+def _normalise_database_url(raw: str) -> str:
+    """Make Railway's standard Postgres URL usable by SQLAlchemy's async engine."""
+    raw = raw.strip()
+    if not raw:
+        raise RuntimeError("DATABASE_URL is empty")
+
+    parsed = urlsplit(raw)
+    asyncpg_schemes = {
+        "postgres",
+        "postgresql",
+        "postgresql+psycopg",
+        "postgresql+psycopg2",
+    }
+    if parsed.scheme not in asyncpg_schemes | {"postgresql+asyncpg"}:
+        # Preserve non-Postgres URLs exactly (notably SQLite's four-slash paths).
+        return raw
+
+    scheme = "postgresql+asyncpg" if parsed.scheme in asyncpg_schemes else parsed.scheme
+
+    # Railway and other providers may append libpq's sslmode. asyncpg uses `ssl`.
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    sslmode = next((value for key, value in query if key == "sslmode"), None)
+    if sslmode is not None and not any(key == "ssl" for key, _ in query):
+        query = [(key, value) for key, value in query if key != "sslmode"]
+        query.append(("ssl", sslmode))
+
+    return urlunsplit(
+        (scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
+    )
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str = "".join(
         os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'").split()
     )
     admin_ids: List[int] = field(default_factory=lambda: _int_list(os.getenv("ADMIN_IDS", "")))
-    database_url: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///jonex.db")
+    database_url: str = _normalise_database_url(
+        os.getenv("DATABASE_URL", "sqlite+aiosqlite:///jonex.db")
+    )
 
     # Public usernames are safer defaults than hard-coded numeric IDs. The
     # link is also used as a fallback when a custom numeric ID is configured.
@@ -225,7 +255,12 @@ class BotSetting(Base):
 # ============================================================
 # DATABASE ENGINE
 # ============================================================
-engine = create_async_engine(config.database_url, echo=False, future=True)
+engine = create_async_engine(
+    config.database_url,
+    echo=False,
+    pool_pre_ping=True,
+    connect_args={"timeout": 30} if config.database_url.startswith("sqlite") else {},
+)
 SessionFactory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -296,7 +331,7 @@ async def init_db() -> None:
             if package.name not in existing_tg_names:
                 s.add(package)
         await s.commit()
-    logger.info("Database initialised at %s", config.database_url)
+    logger.info("Database initialised (backend=%s)", engine.url.get_backend_name())
 
 
 @asynccontextmanager
@@ -314,7 +349,7 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
 # DATABASE QUERIES
 # ============================================================
 def gen_order_id() -> str:
-    return f"JNX-{_utcnow().strftime('%Y%m%d')}-{''.join(random.choices(string.digits, k=5))}"
+    return f"JNX-{_utcnow().strftime('%Y%m%d')}-{''.join(random.choices(string.digits, k=8))}"
 
 
 def gen_ref_code(uid: int) -> str:
@@ -375,9 +410,24 @@ async def get_user_by_username(uname: str) -> Optional[User]:
         return res.scalar_one_or_none()
 
 
-async def mark_verified(tid: int) -> None:
+async def mark_verified(tid: int) -> Optional[int]:
+    """Mark a user verified once; return their referrer ID only for first verification."""
     async with db_session() as s:
-        await s.execute(update(User).where(User.telegram_id == tid).values(verified=True))
+        row = (
+            await s.execute(
+                select(User.referred_by)
+                .where(User.telegram_id == tid, User.verified.is_(False))
+                .with_for_update()
+            )
+        ).first()
+        if row is None:
+            return None
+        await s.execute(
+            update(User)
+            .where(User.telegram_id == tid, User.verified.is_(False))
+            .values(verified=True)
+        )
+        return int(row[0]) if row[0] is not None else 0
 
 
 async def set_banned(tid: int, banned: bool, reason: str = "", admin_id: int = 0) -> None:
@@ -449,12 +499,14 @@ async def get_panel(pid: int) -> Optional[Panel]:
 
 
 async def decrement_panel_stock(pid: int) -> bool:
+    """Atomically reserve one in-stock panel so concurrent approvals cannot oversell."""
     async with db_session() as s:
-        p = await s.get(Panel, pid)
-        if not p or p.stock <= 0:
-            return False
-        p.stock -= 1
-        return True
+        result = await s.execute(
+            update(Panel)
+            .where(Panel.id == pid, Panel.stock > 0)
+            .values(stock=Panel.stock - 1)
+        )
+        return result.rowcount == 1
 
 
 async def create_order(
@@ -494,9 +546,40 @@ async def update_order(order_id: str, status: str, **kw: Any) -> bool:
         return True
 
 
+async def transition_order(
+    order_id: str, expected_statuses: tuple[str, ...], new_status: str
+) -> bool:
+    """Atomically claim an order transition so duplicate admin clicks are harmless."""
+    async with db_session() as s:
+        result = await s.execute(
+            update(Order)
+            .where(Order.order_id == order_id, Order.status.in_(expected_statuses))
+            .values(status=new_status)
+        )
+        return result.rowcount == 1
+
+
 async def create_payment_request(order_id: str, uid: int, amt: float, proof: str) -> None:
     async with db_session() as s:
         s.add(PaymentRequest(order_id=order_id, user_id=uid, amount=amt, proof=proof))
+
+
+async def submit_payment_proof(order_id: str, uid: int, amount: float, proof: str) -> bool:
+    """Save one proof and advance only its owner's still-pending order."""
+    async with db_session() as s:
+        result = await s.execute(
+            update(Order)
+            .where(
+                Order.order_id == order_id,
+                Order.user_id == uid,
+                Order.status == "PENDING",
+            )
+            .values(status="PAYMENT_SUBMITTED", payment_ref=proof)
+        )
+        if result.rowcount != 1:
+            return False
+        s.add(PaymentRequest(order_id=order_id, user_id=uid, amount=amount, proof=proof))
+        return True
 
 
 async def update_payment_status(order_id: str, status: str, admin_id: int) -> None:
@@ -604,24 +687,62 @@ async def can_claim_tg_reward(uid: int) -> bool:
     user = await get_user(uid)
     if not user:
         return False
-    req = int(await get_setting("referral_tg_requirement", "15"))
-    claimed = int(await get_setting(f"tg_claimed_{uid}", "0"))
-    return user.successful_referrals >= req and claimed < (user.successful_referrals // req)
+    try:
+        req = int(await get_setting("referral_tg_requirement", "15"))
+        claimed = int(await get_setting(f"tg_claimed_{uid}", "0"))
+    except (TypeError, ValueError):
+        return False
+    return req > 0 and claimed < (user.successful_referrals // req)
 
 
 async def can_claim_panel_reward(uid: int) -> bool:
     user = await get_user(uid)
     if not user:
         return False
-    req = int(await get_setting("referral_panel_requirement", "10"))
-    claimed = int(await get_setting(f"panel_claimed_{uid}", "0"))
-    return user.successful_referrals >= req and claimed < (user.successful_referrals // req)
+    try:
+        req = int(await get_setting("referral_panel_requirement", "10"))
+        claimed = int(await get_setting(f"panel_claimed_{uid}", "0"))
+    except (TypeError, ValueError):
+        return False
+    return req > 0 and claimed < (user.successful_referrals // req)
 
 
-async def record_reward(uid: int, kind: str) -> None:
-    key = f"{kind}_claimed_{uid}"
-    cur = int(await get_setting(key, "0"))
-    await set_setting(key, str(cur + 1))
+async def record_reward(uid: int, kind: str) -> bool:
+    """Record a referral reward only if a new milestone is still unclaimed."""
+    if kind not in ("tg", "panel"):
+        return False
+    async with db_session() as s:
+        user = (
+            await s.execute(
+                select(User).where(User.telegram_id == uid).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if not user:
+            return False
+        requirement_key = "referral_tg_requirement" if kind == "tg" else "referral_panel_requirement"
+        requirement_row = await s.get(BotSetting, requirement_key)
+        try:
+            requirement = int(requirement_row.value) if requirement_row else (15 if kind == "tg" else 10)
+        except (TypeError, ValueError):
+            return False
+        if requirement < 1:
+            return False
+        key = f"{kind}_claimed_{uid}"
+        claimed_row = await s.get(BotSetting, key, with_for_update=True)
+        try:
+            claimed = int(claimed_row.value) if claimed_row else 0
+        except (TypeError, ValueError):
+            claimed = 0
+        if claimed >= user.successful_referrals // requirement:
+            return False
+        if claimed_row:
+            claimed_row.value = str(claimed + 1)
+        else:
+            s.add(BotSetting(key=key, value="1"))
+        return True
+
+
+_channel_access_alerted = False
 
 
 def _channel_candidates(chat_id: str, channel_link: str) -> List[str]:
@@ -642,7 +763,7 @@ def _channel_candidates(chat_id: str, channel_link: str) -> List[str]:
 
 async def is_channel_member(
     bot: Bot, chat_id: str, uid: int, channel_link: str = ""
-) -> bool:
+) -> Optional[bool]:
     candidates = _channel_candidates(chat_id, channel_link)
     if not candidates:
         return True
@@ -651,20 +772,14 @@ async def is_channel_member(
         try:
             m = await bot.get_chat_member(chat_id=candidate, user_id=uid)
             return m.status not in ("left", "kicked")
-        except TelegramBadRequest as e:
-            message = str(e).lower()
-            logger.warning("Membership check failed for %s: %s", candidate, e)
-            # This means Telegram cannot expose the member list because the
-            # bot is not an admin. Do not falsely block a user in that case.
-            if "member list is inaccessible" in message:
-                return True
-            # Try the public username from the configured link if a numeric
-            # channel ID is stale or incorrect.
-            continue
+        except TelegramAPIError as e:
+            logger.warning("Membership check unavailable for %s: %s", candidate, e)
         except Exception as e:
-            logger.error("Membership error for %s: %s", candidate, e)
+            logger.exception("Unexpected membership-check error for %s: %s", candidate, e)
             continue
-    return False
+    # An API error does not prove that the user has not joined. Keep the
+    # requirement fail-closed, but let the handler show an accurate error.
+    return None
 
 
 async def send_to_admins(bot: Bot, text: str, kb: Optional[InlineKeyboardMarkup] = None) -> None:
@@ -675,74 +790,30 @@ async def send_to_admins(bot: Bot, text: str, kb: Optional[InlineKeyboardMarkup]
             logger.error("Failed to notify admin %s: %s", aid, e)
 
 
-async def send_payment_proof_to_admins(
-    bot: Bot,
-    source_message: Message,
-    text: str,
-    order_id: str,
+async def send_payment_review(
+    bot: Bot, text: str, order_id: str, proof_text: str = "", proof_photo_id: str = ""
 ) -> None:
-    """Send payment details and the user's proof in one admin message.
-
-    Telegram photos are represented by ``Message.photo`` and files sent as
-    documents by ``Message.document``. The old flow stored their file_id but
-    only sent a text notification, so admins could not see the proof.
-    """
-    markup = approval_kb(order_id)
-    photo_id = source_message.photo[-1].file_id if source_message.photo else None
-    document_id = source_message.document.file_id if source_message.document else None
-
-    if source_message.photo:
-        proof_kind = "photo"
-    elif source_message.document:
-        proof_kind = "document"
-    else:
-        proof_kind = "text"
-
+    """Send approval controls plus the actual payment proof to every configured admin."""
     for aid in config.admin_ids:
         try:
-            if photo_id:
+            if proof_photo_id:
                 await bot.send_photo(
                     aid,
-                    photo=photo_id,
+                    proof_photo_id,
                     caption=text,
-                    reply_markup=markup,
-                    parse_mode="HTML",
-                )
-            elif document_id:
-                await bot.send_document(
-                    aid,
-                    document=document_id,
-                    caption=text,
-                    reply_markup=markup,
+                    reply_markup=approval_kb(order_id),
                     parse_mode="HTML",
                 )
             else:
+                safe_proof = escape(proof_text.strip())[:1200] or "Not provided"
                 await bot.send_message(
                     aid,
-                    text,
-                    reply_markup=markup,
+                    f"{text}\n<b>Payment reference:</b>\n<code>{safe_proof}</code>",
+                    reply_markup=approval_kb(order_id),
                     parse_mode="HTML",
                 )
         except Exception as e:
-            logger.error(
-                "Failed to send %s payment proof for order %s to admin %s: %s",
-                proof_kind,
-                order_id,
-                aid,
-                e,
-            )
-            # Keep the approval workflow usable even if Telegram rejects the
-            # attachment (for example, an expired file_id).
-            if photo_id or document_id:
-                try:
-                    await bot.send_message(
-                        aid,
-                        text + "\n\n⚠️ Proof attachment could not be forwarded.",
-                        reply_markup=markup,
-                        parse_mode="HTML",
-                    )
-                except Exception as fallback_error:
-                    logger.error("Admin fallback notification failed: %s", fallback_error)
+            logger.error("Failed to send payment review for %s to admin %s: %s", order_id, aid, e)
 
 
 async def notify_referral_success(bot: Bot, referrer: User, referred: User) -> None:
@@ -934,7 +1005,8 @@ WELCOME_VERIFY = (
     "━━━━━━━━━━━━━━━━━━\n\n"
     "👋 Welcome, <b>{name}</b>!\n\n"
     "Welcome to Zonex X Bot.\n\n"
-    "Before continuing, you must join the required channel(s).\n\n"
+    "Join both required channels. The bot will verify you automatically after you join them. "
+    "If it does not update, tap “I Have Verified” below.\n\n"
     "<b>Required Channels:</b>\n"
     "{channels}"
 )
@@ -942,7 +1014,7 @@ WELCOME_VERIFY = (
 
 # ------------------------- START -------------------------
 async def _send_welcome(msg: Message, verified: bool) -> None:
-    name = display_name(msg.from_user)
+    name = escape(display_name(msg.from_user))
     if verified:
         await msg.answer(WELCOME_MAIN.format(name=name), reply_markup=main_menu_kb(), parse_mode="HTML")
     else:
@@ -999,31 +1071,115 @@ async def start_plain(msg: Message) -> None:
 # ------------------------- VERIFY -------------------------
 @router.callback_query(F.data == "verify_check")
 async def cb_verify(call: CallbackQuery) -> None:
+    global _channel_access_alerted
     uid = call.from_user.id
     bot = call.bot
 
     ch1_ok = await is_channel_member(bot, config.channel_1_id, uid, config.channel_1_link)
     ch2_ok = await is_channel_member(bot, config.channel_2_id, uid, config.channel_2_link)
 
+    if ch1_ok is None or ch2_ok is None:
+        await call.answer(
+            "⚠️ I can't check channel membership right now. Please contact the bot admin.",
+            show_alert=True,
+        )
+        if not _channel_access_alerted:
+            _channel_access_alerted = True
+            await send_to_admins(
+                bot,
+                "⚠️ <b>Channel verification is blocked by Telegram</b>\n\n"
+                "The bot cannot check members in one or both configured channels. "
+                "Add @ZonexXearningBot as an administrator in both channels, "
+                "then users can press “I Have Verified” again.\n\n"
+                f"Channel 1: <code>{escape(config.channel_1_id)}</code>\n"
+                f"Channel 2: <code>{escape(config.channel_2_id)}</code>",
+            )
+        return
+
     if not (ch1_ok and ch2_ok):
         await call.answer("❌ Please join both channels first.", show_alert=True)
         return
 
-    user = await get_user(uid)
-    if user and not user.verified:
-        await mark_verified(uid)
-        if user.referred_by:
-            await increment_successful_ref(user.referred_by)
-            referrer = await get_user(user.referred_by)
-            if referrer:
-                await notify_referral_success(bot, referrer, user)
+    referrer_id = await mark_verified(uid)
+    if referrer_id:
+        await increment_successful_ref(referrer_id)
+        referrer = await get_user(referrer_id)
+        verified_user = await get_user(uid)
+        if referrer and verified_user:
+            await notify_referral_success(bot, referrer, verified_user)
 
     await call.message.edit_text(
-        WELCOME_MAIN.format(name=call.from_user.full_name),
+        WELCOME_MAIN.format(name=escape(call.from_user.full_name)),
         reply_markup=main_menu_kb(),
         parse_mode="HTML",
     )
     await call.answer("✅ Verified!")
+
+
+def _is_member_status(member: Any) -> bool:
+    if member.status in ("creator", "administrator", "member"):
+        return True
+    return member.status == "restricted" and bool(getattr(member, "is_member", False))
+
+
+def _is_configured_channel(chat: types.Chat) -> bool:
+    for chat_id, link in (
+        (config.channel_1_id, config.channel_1_link),
+        (config.channel_2_id, config.channel_2_link),
+    ):
+        for candidate in _channel_candidates(chat_id, link):
+            if candidate.startswith("@"):
+                if chat.username and candidate[1:].casefold() == chat.username.casefold():
+                    return True
+            elif candidate == str(chat.id):
+                return True
+    return False
+
+
+@router.chat_member()
+async def on_channel_member_update(event: types.ChatMemberUpdated) -> None:
+    """Automatically verify a user as soon as they join both required channels."""
+    if not _is_configured_channel(event.chat):
+        return
+
+    user = event.new_chat_member.user
+    if user.is_bot or not _is_member_status(event.new_chat_member):
+        return
+    if _is_member_status(event.old_chat_member):
+        return
+
+    stored_user = await get_user(user.id)
+    if not stored_user or stored_user.is_banned or stored_user.verified:
+        return
+
+    ch1_ok = await is_channel_member(
+        event.bot, config.channel_1_id, user.id, config.channel_1_link
+    )
+    ch2_ok = await is_channel_member(
+        event.bot, config.channel_2_id, user.id, config.channel_2_link
+    )
+    if ch1_ok is not True or ch2_ok is not True:
+        return
+
+    referrer_id = await mark_verified(user.id)
+    if referrer_id is None:
+        return
+    if referrer_id:
+        await increment_successful_ref(referrer_id)
+        referrer = await get_user(referrer_id)
+        verified_user = await get_user(user.id)
+        if referrer and verified_user:
+            await notify_referral_success(event.bot, referrer, verified_user)
+
+    try:
+        await event.bot.send_message(
+            user.id,
+            WELCOME_MAIN.format(name=escape(display_name(user))),
+            reply_markup=main_menu_kb(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Auto-verification welcome could not be sent to user %s", user.id)
 
 
 # ------------------------- BACK -------------------------
@@ -1190,10 +1346,9 @@ async def cb_tg_ref(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "claim_tg")
 async def cb_claim_tg(call: CallbackQuery) -> None:
-    if not await can_claim_tg_reward(call.from_user.id):
-        await call.answer("Not eligible yet.", show_alert=True)
+    if not await record_reward(call.from_user.id, "tg"):
+        await call.answer("Not eligible yet, or this reward was already claimed.", show_alert=True)
         return
-    await record_reward(call.from_user.id, "tg")
     await call.answer("✅ Claimed! Admin will deliver.", show_alert=True)
     await send_to_admins(
         call.bot,
@@ -1278,36 +1433,35 @@ async def cb_tg_submit(call: CallbackQuery, state: FSMContext) -> None:
 async def msg_tg_proof(msg: Message, state: FSMContext) -> None:
     data = await state.get_data()
     order_id = data.get("order_id")
-    proof = (
-        msg.photo[-1].file_id
-        if msg.photo
-        else msg.document.file_id
-        if msg.document
-        else (msg.text or "").strip()
-    )
+    proof_text = (msg.text or "").strip()
+    proof_photo = msg.photo[-1].file_id if msg.photo else ""
+    proof = proof_text or proof_photo
     if not proof:
-        await msg.answer("❌ Payment reference, screenshot, or image file bhejo.")
+        await msg.answer("Send a payment reference as text or attach a screenshot.")
         return
-    o = await get_order(order_id)
-    if not o:
+    o = await get_order(order_id) if order_id else None
+    if not o or o.user_id != msg.from_user.id:
         await msg.answer("Order not found.", reply_markup=main_menu_kb())
         await state.clear()
         return
-    await create_payment_request(order_id, msg.from_user.id, o.amount, proof)
-    await update_order(order_id, "PAYMENT_SUBMITTED", payment_ref=proof)
+    if not await submit_payment_proof(order_id, msg.from_user.id, o.amount, proof):
+        await msg.answer("This order was already submitted or is no longer pending.", reply_markup=main_menu_kb())
+        await state.clear()
+        return
 
     text = (
         "🔔 <b>New TG Purchase</b>\n\n"
-        f"User: @{msg.from_user.username or msg.from_user.id}\n"
+        f"User: @{escape(msg.from_user.username or str(msg.from_user.id))}\n"
         f"User ID: <code>{msg.from_user.id}</code>\n"
-        f"Package: {o.product_name}\n"
+        f"Package: {escape(o.product_name)}\n"
         f"Amount: ₹{o.amount:.2f}\n"
         f"Order ID: <code>{order_id}</code>\n"
-        f"Status: PENDING"
+        "Status: PENDING"
     )
-    await send_payment_proof_to_admins(msg.bot, msg, text, order_id)
+    await send_payment_review(msg.bot, text, order_id, proof_text, proof_photo)
     await msg.answer("✅ Payment submitted! Await admin approval.", reply_markup=main_menu_kb())
     await state.clear()
+
 
 # ------------------------- PANEL MENU -------------------------
 @router.callback_query(F.data == "user_panel")
@@ -1375,10 +1529,9 @@ async def cb_panel_ref(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "claim_panel")
 async def cb_claim_panel(call: CallbackQuery) -> None:
-    if not await can_claim_panel_reward(call.from_user.id):
-        await call.answer("Not eligible yet.", show_alert=True)
+    if not await record_reward(call.from_user.id, "panel"):
+        await call.answer("Not eligible yet, or this reward was already claimed.", show_alert=True)
         return
-    await record_reward(call.from_user.id, "panel")
     await call.answer("✅ Claimed! Admin will deliver.", show_alert=True)
     await send_to_admins(
         call.bot,
@@ -1393,7 +1546,7 @@ async def cb_panel_select(call: CallbackQuery) -> None:
     if not p or not p.is_active:
         await call.answer("Unavailable.", show_alert=True)
         return
-    if p.stock <= 0 and not p.credentials:
+    if p.stock <= 0 and (not p.credentials or p.credentials == MANUAL_DELIVERY_SENTINEL):
         await call.answer("⚠️ Panel out of stock. Contact admin.", show_alert=True)
         return
 
@@ -1447,39 +1600,61 @@ async def cb_panel_submit(call: CallbackQuery, state: FSMContext) -> None:
 async def msg_panel_proof(msg: Message, state: FSMContext) -> None:
     data = await state.get_data()
     order_id = data.get("order_id")
-    proof = (
-        msg.photo[-1].file_id
-        if msg.photo
-        else msg.document.file_id
-        if msg.document
-        else (msg.text or "").strip()
-    )
+    proof_text = (msg.text or "").strip()
+    proof_photo = msg.photo[-1].file_id if msg.photo else ""
+    proof = proof_text or proof_photo
     if not proof:
-        await msg.answer("❌ Payment reference, screenshot, or image file bhejo.")
+        await msg.answer("Send a payment reference as text or attach a screenshot.")
         return
-    o = await get_order(order_id)
-    if not o:
+    o = await get_order(order_id) if order_id else None
+    if not o or o.user_id != msg.from_user.id:
         await msg.answer("Order not found.", reply_markup=main_menu_kb())
         await state.clear()
         return
-    await create_payment_request(order_id, msg.from_user.id, o.amount, proof)
-    await update_order(order_id, "PAYMENT_SUBMITTED", payment_ref=proof)
+    if not await submit_payment_proof(order_id, msg.from_user.id, o.amount, proof):
+        await msg.answer("This order was already submitted or is no longer pending.", reply_markup=main_menu_kb())
+        await state.clear()
+        return
 
     text = (
         "🔔 <b>New Panel Order</b>\n\n"
-        f"User: @{msg.from_user.username or msg.from_user.id}\n"
+        f"User: @{escape(msg.from_user.username or str(msg.from_user.id))}\n"
         f"User ID: <code>{msg.from_user.id}</code>\n"
-        f"Panel: {o.product_name}\n"
+        f"Panel: {escape(o.product_name)}\n"
         f"Amount: ₹{o.amount:.2f}\n"
         f"Order ID: <code>{order_id}</code>\n"
-        f"Status: PENDING"
+        "Status: PENDING"
     )
-    await send_payment_proof_to_admins(msg.bot, msg, text, order_id)
+    await send_payment_review(msg.bot, text, order_id, proof_text, proof_photo)
     await msg.answer("✅ Payment submitted! Await admin approval.", reply_markup=main_menu_kb())
     await state.clear()
 
 
 # ------------------------- ADMIN -------------------------
+@router.message(Command("getfile", "source"))
+async def cmd_getfile(msg: Message) -> None:
+    if not msg.from_user or not is_admin(msg.from_user.id):
+        await msg.answer("⛔ Access denied.")
+        return
+    if msg.chat.type != "private":
+        await msg.answer("Please send /getfile in a private chat with the bot.")
+        return
+
+    source_path = Path(__file__).resolve()
+    try:
+        source_file = BufferedInputFile(
+            source_path.read_bytes(),
+            filename=source_path.name,
+        )
+        await msg.answer_document(
+            source_file,
+            caption="Complete current bot source file (main.py).",
+        )
+    except (OSError, TelegramAPIError):
+        logger.exception("Could not send the bot source file to admin %s", msg.from_user.id)
+        await msg.answer("⚠️ I could not send the source file. Please try again later.")
+
+
 @router.message(Command("admin"))
 async def cmd_admin(msg: Message) -> None:
     if not is_admin(msg.from_user.id):
@@ -1606,8 +1781,10 @@ async def cb_approve(call: CallbackQuery) -> None:
         await call.answer("Already processed.", show_alert=True)
         return
 
+    if not await transition_order(order_id, ("PENDING", "PAYMENT_SUBMITTED"), "APPROVED"):
+        await call.answer("Already processed.", show_alert=True)
+        return
     await update_payment_status(order_id, "APPROVED", call.from_user.id)
-    await update_order(order_id, "APPROVED")
 
     if o.product_type == "TG":
         note = await get_setting("tg_delivery_note", "✅ TG order approved. Admin will contact you.")
@@ -1619,24 +1796,26 @@ async def cb_approve(call: CallbackQuery) -> None:
         p = await get_panel(o.product_id)
         delivered = False
         if p and p.credentials == MANUAL_DELIVERY_SENTINEL:
-            try:
-                await call.bot.send_message(
-                    o.user_id,
-                    "✅ Payment approved.\n\n"
-                    "Admin ab aapko panel manually deliver karega. "
-                    "Please wait for the admin message.",
-                )
+            if await decrement_panel_stock(p.id):
                 await send_to_admins(
                     call.bot,
                     "📦 <b>Manual Panel Delivery Required</b>\n\n"
                     f"User ID: <code>{o.user_id}</code>\n"
-                    f"Panel: {o.product_name}\n"
+                    f"Panel: {escape(o.product_name)}\n"
                     f"Amount: ₹{o.amount:.2f}\n"
                     f"Order ID: <code>{order_id}</code>\n\n"
                     "Payment approved. User ko panel manually bhejo.",
                 )
-            except Exception as e:
-                logger.error("Manual panel notification failed: %s", e)
+                try:
+                    await call.bot.send_message(
+                        o.user_id,
+                        "✅ Payment approved.\n\n"
+                        "Admin ab aapko panel manually deliver karega. "
+                        "Please wait for the admin message.",
+                    )
+                except Exception as e:
+                    logger.error("Manual panel customer notification failed: %s", e)
+                delivered = True
         elif p:
             if p.credentials and (p.stock <= 0):
                 delivery = p.credentials
@@ -1650,7 +1829,7 @@ async def cb_approve(call: CallbackQuery) -> None:
                 try:
                     await call.bot.send_message(
                         o.user_id,
-                        f"✅ <b>Panel Delivered</b>\n\n{delivery}",
+                        f"✅ <b>Panel Delivered</b>\n\n{escape(delivery)}",
                         parse_mode="HTML",
                     )
                     await update_order(order_id, "DELIVERED")
@@ -1681,8 +1860,10 @@ async def cb_reject(call: CallbackQuery) -> None:
     if not o or o.status not in ("PENDING", "PAYMENT_SUBMITTED"):
         await call.answer("Already processed.", show_alert=True)
         return
+    if not await transition_order(order_id, ("PENDING", "PAYMENT_SUBMITTED"), "REJECTED"):
+        await call.answer("Already processed.", show_alert=True)
+        return
     await update_payment_status(order_id, "REJECTED", call.from_user.id)
-    await update_order(order_id, "REJECTED")
     try:
         await call.bot.send_message(
             o.user_id,
@@ -1893,8 +2074,10 @@ async def cmd_set_tg_req(msg: Message) -> None:
         return
     try:
         v = int(msg.text.split()[1])
+        if v < 1:
+            raise ValueError
     except (IndexError, ValueError):
-        await msg.answer("Usage: /set_tg_req <number>")
+        await msg.answer("Usage: /set_tg_req <number> (number must be at least 1)")
         return
     await set_setting("referral_tg_requirement", str(v))
     await msg.answer(f"✅ TG referral requirement = {v}")
@@ -1906,8 +2089,10 @@ async def cmd_set_panel_req(msg: Message) -> None:
         return
     try:
         v = int(msg.text.split()[1])
+        if v < 1:
+            raise ValueError
     except (IndexError, ValueError):
-        await msg.answer("Usage: /set_panel_req <number>")
+        await msg.answer("Usage: /set_panel_req <number> (number must be at least 1)")
         return
     await set_setting("referral_panel_requirement", str(v))
     await msg.answer(f"✅ Panel referral requirement = {v}")
@@ -2345,20 +2530,32 @@ async def catch_text(msg: Message) -> None:
 # ============================================================
 async def main() -> None:
     logger.info("Starting Zonex X Bot...")
-    await init_db()
-
-    bot = Bot(
-        token=config.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
+    bot: Optional[Bot] = None
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        await init_db()
+        bot = Bot(
+            token=config.bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        dp = Dispatcher(storage=MemoryStorage())
+        dp.include_router(router)
+
+        # Check the token and Telegram connectivity before entering polling.
+        bot_info = await bot.get_me()
+        logger.info("Telegram connection verified for @%s", bot_info.username)
+        # Keep queued user updates across Railway restarts.
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Starting Telegram long polling...")
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+    except Exception:
+        logger.exception("Bot failed during startup or while running")
+        raise
     finally:
-        await bot.session.close()
+        if bot is not None:
+            await bot.session.close()
         await engine.dispose()
         logger.info("Bot stopped.")
 
